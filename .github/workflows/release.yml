@@ -1,0 +1,192 @@
+name: Release Ruby
+run-name: Release Ruby ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Ruby version to release (e.g., 3.4.8)'
+        required: true
+        type: string
+      latest:
+        description: 'Mark as latest release'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  RUBY_BUILD_REPO: https://github.com/rbenv/ruby-build.git
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            platform: macos
+          - runner: ubuntu-22.04
+            platform: x86_64_linux
+          - runner: ubuntu-22.04-arm
+            platform: arm64_linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          for pkg in openssl@3 libyaml gmp readline; do
+            brew list "$pkg" &>/dev/null || brew install "$pkg"
+          done
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf bison build-essential libssl-dev libyaml-dev \
+            libreadline-dev zlib1g-dev libncurses5-dev libffi-dev libgdbm-dev
+
+      - name: Install ruby-build
+        run: |
+          git clone --depth 1 "$RUBY_BUILD_REPO" ~/.ruby-build
+          echo "$HOME/.ruby-build/bin" >> "$GITHUB_PATH"
+
+      - name: Build Ruby ${{ inputs.version }}
+        run: |
+          export RUBY_CONFIGURE_OPTS="--enable-load-relative --disable-install-doc"
+          JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          export MAKE_OPTS="-j${JOBS}"
+
+          ~/.ruby-build/bin/ruby-build "${{ inputs.version }}" "./ruby-${{ inputs.version }}"
+
+      - name: Ad-hoc codesign (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "Signing all Mach-O binaries with ad-hoc signature..."
+
+          # Sign executables in bin/
+          find ./ruby-${{ inputs.version }}/bin -type f -perm +111 | while read -r file; do
+            if file "$file" | grep -q "Mach-O"; then
+              echo "Signing: $file"
+              codesign --sign - --force "$file" || true
+            fi
+          done
+
+          # Sign .bundle and .dylib files
+          find ./ruby-${{ inputs.version }} -type f \( -name "*.bundle" -o -name "*.dylib" \) | while read -r file; do
+            echo "Signing: $file"
+            codesign --sign - --force "$file" || true
+          done
+
+          echo "Code signing complete"
+
+      - name: Create tarball
+        run: |
+          tar -czf ruby-${{ inputs.version }}.${{ matrix.platform }}.tar.gz ./ruby-${{ inputs.version }}
+
+      - name: Test Ruby
+        run: |
+          RUBY="./ruby-${{ inputs.version }}/bin/ruby"
+          $RUBY --version
+          $RUBY -e "puts RUBY_DESCRIPTION"
+          $RUBY -r json -r yaml -r openssl -e "puts 'Core gems OK'"
+
+          # Test YJIT for Ruby 3.1+
+          VERSION="${{ inputs.version }}"
+          MAJOR="${VERSION%%.*}"
+          MINOR="${VERSION#*.}"; MINOR="${MINOR%%.*}"
+          if [[ "$MAJOR" -ge 3 && "$MINOR" -ge 1 ]] || [[ "$MAJOR" -gt 3 ]]; then
+            echo "Testing YJIT..."
+            $RUBY --yjit -e "puts 'YJIT OK'" || { echo "YJIT test failed!"; exit 1; }
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruby-${{ inputs.version }}-${{ matrix.platform }}
+          path: ruby-${{ inputs.version }}.${{ matrix.platform }}.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: ruby-${{ inputs.version }}-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Generate attestations
+        uses: actions/attest-build-provenance@v3.1.0
+        with:
+          subject-path: 'artifacts/*.tar.gz'
+
+      - name: Delete existing release (if any)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${VERSION}" --repo "${{ github.repository }}" --yes || true
+          gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/${VERSION}" 2>/dev/null || true
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ inputs.latest }}" == "true" ]]; then
+            latest_flag="--latest"
+          else
+            latest_flag="--latest=false"
+          fi
+
+          cat > /tmp/release_notes.md << 'EOF'
+          Ruby precompiled binaries with ad-hoc code signing for macOS.
+
+          ## Platforms
+          - `ruby-VERSION.macos.tar.gz` - macOS arm64 (Apple Silicon)
+          - `ruby-VERSION.x86_64_linux.tar.gz` - Linux x86_64
+          - `ruby-VERSION.arm64_linux.tar.gz` - Linux arm64
+
+          ## Usage with mise
+
+          ```toml
+          [settings.ruby]
+          precompiled_url = "alexey1312/ruby-prebuilt"
+          ```
+          EOF
+
+          sed -i "s/VERSION/${VERSION}/g" /tmp/release_notes.md
+
+          gh release create "${VERSION}" \
+            --repo "${{ github.repository }}" \
+            --title "Ruby ${VERSION}" \
+            --notes-file /tmp/release_notes.md \
+            $latest_flag \
+            artifacts/*.tar.gz
+
+      - name: Summary
+        run: |
+          echo "## Ruby ${VERSION} Released" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Files" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          ls -lh artifacts/ | tail -n +2 | while read -r line; do
+            echo "- \`$(echo $line | awk '{print $NF}')\` ($(echo $line | awk '{print $5}'))" >> $GITHUB_STEP_SUMMARY
+          done
