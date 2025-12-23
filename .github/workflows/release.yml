@@ -40,7 +40,8 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          for pkg in openssl@3 libyaml gmp readline; do
+          # Install brew dependencies (except libyaml - we build from source)
+          for pkg in openssl@3 gmp readline; do
             brew list "$pkg" &>/dev/null || brew install "$pkg"
           done
 
@@ -48,8 +49,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          # Note: libyaml-dev removed - we build from source for portability
           sudo apt-get install -y \
-            autoconf bison build-essential libssl-dev libyaml-dev \
+            autoconf bison build-essential libssl-dev \
             libreadline-dev zlib1g-dev libncurses5-dev libffi-dev libgdbm-dev
 
       - name: Install ruby-build
@@ -57,9 +59,31 @@ jobs:
           git clone --depth 1 "$RUBY_BUILD_REPO" ~/.ruby-build
           echo "$HOME/.ruby-build/bin" >> "$GITHUB_PATH"
 
+      - name: Build libyaml from source
+        run: |
+          LIBYAML_VERSION="0.2.5"
+          echo "Building libyaml ${LIBYAML_VERSION} from source..."
+
+          curl -sL "https://github.com/yaml/libyaml/releases/download/${LIBYAML_VERSION}/yaml-${LIBYAML_VERSION}.tar.gz" | tar -xz
+          cd "yaml-${LIBYAML_VERSION}"
+
+          # Configure for static library only
+          ./configure --prefix="${GITHUB_WORKSPACE}/libyaml" \
+                      --enable-static \
+                      --disable-shared
+
+          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+          make install
+
+          echo "LIBYAML_DIR=${GITHUB_WORKSPACE}/libyaml" >> "$GITHUB_ENV"
+          echo "libyaml installed to ${GITHUB_WORKSPACE}/libyaml"
+          ls -la "${GITHUB_WORKSPACE}/libyaml/lib/"
+
       - name: Build Ruby ${{ inputs.version }}
         run: |
           export RUBY_CONFIGURE_OPTS="--enable-load-relative --disable-install-doc"
+          export RUBY_CONFIGURE_OPTS="$RUBY_CONFIGURE_OPTS --with-libyaml-dir=$LIBYAML_DIR"
+
           JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
           export MAKE_OPTS="-j${JOBS}"
 
@@ -85,6 +109,35 @@ jobs:
           done
 
           echo "Code signing complete"
+
+      - name: Verify static linking
+        run: |
+          echo "Checking psych.bundle dependencies..."
+          PSYCH=$(find "./ruby-${{ inputs.version }}" -name "psych.bundle" -o -name "psych.so" | head -1)
+
+          if [[ -z "$PSYCH" ]]; then
+            echo "ERROR: psych extension not found!"
+            exit 1
+          fi
+
+          echo "Found: $PSYCH"
+
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            otool -L "$PSYCH"
+            # Verify no dynamic libyaml dependency
+            if otool -L "$PSYCH" | grep -q "libyaml"; then
+              echo "ERROR: psych.bundle has dynamic libyaml dependency!"
+              exit 1
+            fi
+            echo "✅ psych.bundle is statically linked (no libyaml dependency)"
+          else
+            ldd "$PSYCH" || readelf -d "$PSYCH"
+            if ldd "$PSYCH" 2>/dev/null | grep -q "libyaml"; then
+              echo "ERROR: psych.so has dynamic libyaml dependency!"
+              exit 1
+            fi
+            echo "✅ psych.so is statically linked (no libyaml dependency)"
+          fi
 
       - name: Create tarball
         run: |
